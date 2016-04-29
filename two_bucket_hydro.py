@@ -47,27 +47,25 @@ class TwoBucketHydro(Component):
 
     """Calculate soil moisture and runoff on a gridded landscape.
 
-    Landlab component that implements a one-bucket distributed hydrology model.
-    """
-#    Construction::
-#
-#        Flexure(grid, eet=65e3, youngs=7e10, method='airy', rho_mantle=3300.,
-#                gravity=9.80665)
-#
-#    Parameters
-#    ----------
-#    grid : RasterModelGrid
-#        A grid.
-#    eet : float, optional
-#        Effective elastic thickness (m).
-#    youngs : float, optional
-#        Young's modulus.
-#    method : {'airy', 'flexure'}, optional
-#        Method to use to calculate deflections.
-#    rho_mantle : float, optional
-#        Density of the mantle (kg / m^3).
-#    gravity : float, optional
-#        Acceleration due to gravity (m / s^2).
+    Landlab component that implements a two-bucket distributed hydrology model.
+
+    Construction::
+
+        TwoBucketHydro(grid, rain_rate=0.001, bucket_capacity=1.0, 
+                       concentration_time=1.0, T_infilt=1.0, **kwds)
+
+    Parameters
+    ----------
+    grid : ModelGrid
+        A Landlab grid.
+    rain_rate : float, optional
+        Rainfall or snowmelt rate (m/hr).
+    bucket_capacity : float, optional
+        Water storage capacity in upper layer (m)
+    concentration_time : float, optional
+        Concentration-time parameter for runoff (hr)
+    T_infilt : float, optional
+        Infiltration time scale, hr
 #
 #    Examples
 #    --------
@@ -232,7 +230,7 @@ class TwoBucketHydro(Component):
     def run_one_step(self, dt):
         """Update the storage.
         """
-        # Calculate infiltration at base of soil layer, in m/hr
+        # Calculate infiltration at base of upper soil layer, in m/hr
         infilt_rate = self._infilt_coef * self.u
 
         # Calculate overland flow fluxes
@@ -240,9 +238,11 @@ class TwoBucketHydro(Component):
         u_ex[np.where(u_ex < 0.0)[0]] = 0.0
         qr = self.flow_direction * u_ex**2 / self.concentration_time
 
-        # Calculate the rate of change
+        # Calculate the divergence of overland flow flux
         dqrda = self.grid.calc_face_flux_divergence_at_cell(qr)
-        #print dqrda
+
+        # Calculate the shallow subsurface flow
+        #qss = ?
 
     def move_water(self, dt):
         """Transport water between buckets.
