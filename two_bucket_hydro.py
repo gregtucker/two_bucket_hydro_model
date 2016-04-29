@@ -7,50 +7,35 @@ Examples
 Create a grid on which we will run the calculations.
 
 >>> from landlab import RasterModelGrid
->>> from landlab.components.flexure import TwoBucketHydro
->>> grid = RasterModelGrid((5, 4), spacing=(1.e4, 1.e4))
+>>> import numpy as np
+>>> grid = RasterModelGrid((4, 5), spacing=(10., 10.))
+>>> z = grid.add_zeros('node', 'topographic__elevation')
+>>> z[grid.core_nodes] = np.arange(grid.number_of_core_nodes) + 1
 
 Check the fields that are used as input to the two_bucket_hydro component.
 
 >>> TwoBucketHydro.input_var_names # doctest: +NORMALIZE_WHITESPACE
-('lithosphere__overlying_pressure_increment',)
+('topographic__elevation',)
 
 Check the units for the fields.
 
-#>>> TwoBucketHydro.var_units('top_layer__XXX')
-#'Pa'
+>>> TwoBucketHydro.var_units('upper_layer__water_content')
+'m'
 
 If you are not sure about one of the input or output variables, you can
 get help for specific variables.
 
-#>>> TwoBucketHydro.var_help('lithosphere__overlying_pressure_increment')
-#name: lithosphere__overlying_pressure_increment
-#description:
-#  Applied pressure to the lithosphere over a time step
-#units: Pa
-#at: node
-#intent: in
-#
-#>>> flex = Flexure(grid)
-#
-#In creating the component, a field (initialized with zeros) was added to the
-#grid. Reset the interior nodes for the loading.
-#
-#>>> dh = grid.at_node['lithosphere__overlying_pressure_increment']
-#>>> dh = dh.reshape(grid.shape)
-#>>> dh[1:-1, 1:-1] = flex.gamma_mantle
-#
-#>>> flex.update()
-#
-#>>> flex.output_var_names
-#('lithosphere__elevation_increment',)
-#>>> flex.grid.at_node['lithosphere__elevation_increment']
-#...     # doctest: +NORMALIZE_WHITESPACE
-#array([ 0., 0., 0., 0.,
-#        0., 1., 1., 0.,
-#        0., 1., 1., 0.,
-#        0., 1., 1., 0.,
-#        0., 0., 0., 0.])
+>>> TwoBucketHydro.var_help('upper_layer__water_content')
+name: upper_layer__water_content
+description:
+  Water volume per unit area in upper layer
+units: m
+at: node
+intent: out
+>>> tbhm = TwoBucketHydro(grid)
+>>> tbhm.source_node
+array([ 6,  7,  8,  6,  7,  8,  8, 11, 12, 13, 11, 12, 13, 13, 11, 12, 13])
+>>> tbhm.run_one_step(1.0)
 """
 
 import numpy as np
@@ -62,7 +47,7 @@ class TwoBucketHydro(Component):
 
     """Calculate soil moisture and runoff on a gridded landscape.
 
-    Landlab component that implements a two-bucket distributed hydrology model.
+    Landlab component that implements a one-bucket distributed hydrology model.
     """
 #    Construction::
 #
@@ -130,31 +115,43 @@ class TwoBucketHydro(Component):
 
     _name = 'TwoBucketHydro'
 
-    _input_var_names = ()
+    _input_var_names = (
+        'topographic__elevation',
+    )
 
     _output_var_names = (
         'upper_layer__water_content',
-        'lower_layer__water_content'
+        'source_node',
+        'runoff_discharge',
     )
 
     _var_units = {
+        'topographic__elevation' : 'm',
         'upper_layer__water_content': 'm',
-        'lower_layer__water_content': 'm',
+        'source_node' : '-',
+        'runoff_discharge' : 'm2/hr',
     }
 
     _var_mapping = {
+        'topographic__elevation' : 'node',
         'upper_layer__water_content': 'node',
-        'lower_layer__water_content': 'node',
+        'source_node' : 'face',
+        'runoff_discharge' : 'face',
     }
 
     _var_doc = {
+        'topographic__elevation' : 
+            'Elevation of land surface',
         'upper_layer__water_content':
             'Water volume per unit area in upper layer',
-        'lower_layer__water_content':
-            'Water volume per unit area in lower layer',
+        'source_node' : 
+            'ID of node whose runoff flows along this link',
+        'runoff_discharge' :
+            'Overland flow discharge per unit width',
     }
 
-    def __init__(self, grid, rain_rate=0.001, **kwds):
+    def __init__(self, grid, rain_rate=0.001, bucket_capacity=1.0, 
+                 concentration_time=1.0, T_infilt=1.0, **kwds):
         """Initialize the flexure component.
 
         Parameters
@@ -163,10 +160,18 @@ class TwoBucketHydro(Component):
             A grid.
         rain_rate : float, optional
             Rainfall or snowmelt rate (m/hr).
+        bucket_capacity : float, optional
+            Water storage capacity in upper layer (m)
+        concentration_time : float, optional
+            Concentration-time parameter for runoff (hr)
+        T_infilt : float, optional
+            Infiltration time scale, hr
         """
 
         self._rain_rate = rain_rate
-
+        self._bucket_capacity = bucket_capacity
+        self._concentration_time = concentration_time
+        self._infilt_coef = 1.0 / T_infilt
         self._grid = grid
 
         super(TwoBucketHydro, self).__init__(grid, **kwds)
@@ -175,112 +180,93 @@ class TwoBucketHydro(Component):
             if name not in self.grid.at_node:
                 self.grid.add_zeros('node', name, units=self._var_units[name])
 
+        self.z = self.grid.at_node['topographic__elevation']
+
         for name in self._output_var_names:
             if name not in self.grid.at_node:
-                self.grid.add_zeros('node', name, units=self._var_units[name])
+                if name == 'source_node':
+                    self.grid.add_zeros(self._var_mapping[name], name, units=self._var_units[name], dtype=int)
+                else:
+                    self.grid.add_zeros(self._var_mapping[name], name, units=self._var_units[name])
 
-        self._r = self._set_kei_func_grid()
+        self.u = self.grid.at_node['upper_layer__water_content']
+        self.source_node = self.grid.at_face['source_node']
+        self.q = self.grid.at_face['runoff_discharge']
 
-    @property
-    def eet(self):
-        """Effective elastic thickness (m)."""
-        return self._eet
+        self.flow_direction = np.zeros(self.grid.number_of_faces)
 
-    @eet.setter
-    def eet(self, new_val):
-        if new_val <= 0:
-            raise ValueError('Effective elastic thickness must be positive.')
-        self._r = self._set_kei_func_grid()
-        self._eet = new_val
-
-    @property
-    def youngs(self):
-        """Young's modulus of lithosphere (Pa)."""
-        return self._youngs
-
-    @property
-    def rho_mantle(self):
-        """Density of mantle (kg/m^3)."""
-        return self._rho_mantle
+        # Identify source nodes for each link: that is, which node is higher.
+        # Here we do it with a crude old loop... slow, yes, but we only do this
+        # once.
+        for face in self.grid.active_faces:
+            head = self.grid.node_at_link_head[self.grid.link_at_face[face]]
+            tail = self.grid.node_at_link_tail[self.grid.link_at_face[face]]
+            if self.z[head] > self.z[tail]:
+                self.source_node[face] = head
+                self.flow_direction[face] = -1
+            else:
+                self.source_node[face] = tail
+                self.flow_direction[face] = 1
 
     @property
-    def gamma_mantle(self):
-        """Specific density of mantle (N/m^3)."""
-        return self._rho_mantle * self._gravity
+    def rain_rate(self):
+        """Rainfall or snowmelt rate (m/hr)."""
+        return self._rain_rate
+
+    @rain_rate.setter
+    def rain_rate(self, new_val):
+        if new_val < 0.0:
+            raise ValueError('Rainfall rate must be >=0.')
+        self._rain_rate = new_val
 
     @property
-    def gravity(self):
-        """Acceleration due to gravity (m/s^2)."""
-        return self._gravity
+    def bucket_capacity(self):
+        """Upper soil level water-storage capacity (m)."""
+        return self._bucket_capacity
 
     @property
-    def method(self):
-        """Name of method used to calculate deflections."""
-        return self._method
+    def concentration_time(self):
+        """Concentration-time parameter for surface runoff (hr)."""
+        return self._concentration_time
 
-    @property
-    def alpha(self):
-        """Flexure parameter (m)."""
-        return get_flexure_parameter(self._eet, self._youngs, 2,
-                                     gamma_mantle=self.gamma_mantle)
+    def run_one_step(self, dt):
+        """Update the storage.
+        """
+        # Calculate infiltration at base of soil layer, in m/hr
+        infilt_rate = self._infilt_coef * self.u
 
-    def _set_kei_func_grid(self):
-        from scipy.special import kei
+        # Calculate overland flow fluxes
+        u_ex = self.u[self.source_node] - self._bucket_capacity
+        u_ex[np.where(u_ex < 0.0)[0]] = 0.0
+        qr = self.flow_direction * u_ex**2 / self.concentration_time
 
-        dx, dy = np.meshgrid(
-            np.arange(self._grid.number_of_node_columns) * self._grid.dx,
-            np.arange(self._grid.number_of_node_rows) * self._grid.dy)
+        # Calculate the rate of change
+        dqrda = self.grid.calc_face_flux_divergence_at_cell(qr)
+        #print dqrda
 
-        return kei(np.sqrt(dx ** 2 + dy ** 2) / self.alpha)
-
-    def update(self, n_procs=1):
-        """Update fields with current loading conditions.
+    def move_water(self, dt):
+        """Transport water between buckets.
 
         Parameters
         ----------
-        n_procs : int, optional
-            Number of processors to use for calculations.
+        dt : float
+            Time step.
         """
-        load = self.grid.at_node['lithosphere__overlying_pressure_increment']
-        deflection = self.grid.at_node['lithosphere__elevation_increment']
+        
+        # Overland flow flux
+        excess_water = np.maximum(0.0, \
+                       self.u[self.grid.source_node[self.grid.active_links]] \
+                       - self.bucket_capacity)
+        self.q[self.grid.active_links] = (excess_water * excess_water) \
+                                         / self._concentration_time
 
-        new_load = load.copy()
+        
 
-        deflection.fill(0.)
 
-        if self._method == 'airy':
-            deflection[:] = new_load / self.gamma_mantle
-        else:
-            self.subside_loads(new_load, deflection=deflection,
-                               n_procs=n_procs)
-
-    def subside_loads(self, loads, deflection=None, n_procs=1):
-        """Subside surface due to multiple loads.
-
-        Parameters
-        ----------
-        loads : ndarray of float
-            Loads applied to each grid node.
-        deflection : ndarray of float, optional
-            Buffer to place resulting deflection values.
-        n_procs : int, optional
-            Number of processors to use for calculations.
-
-        Returns
-        -------
-        ndarray of float
-            Deflections caused by the loading.
-        """
-        if deflection is None:
-            deflection = np.empty(self.shape, dtype=np.float)
-
-        from .cfuncs import subside_grid_in_parallel
-
-        w = deflection.reshape(self._grid.shape)
-        load = loads.reshape(self._grid.shape)
-
-        subside_grid_in_parallel(w, load * self._grid.dx * self._grid.dy,
-                                 self._r, self.alpha, self.gamma_mantle,
-                                 n_procs)
-
-        return deflection
+if __name__ == '__main__':
+    from landlab import RasterModelGrid
+    grid = RasterModelGrid(4, 5)
+    z = grid.add_zeros('node', 'topographic__elevation')
+    z[:] = np.arange(grid.number_of_nodes)
+    tbh = TwoBucketHydro(grid)
+    tbh.run_one_step(1.0)
